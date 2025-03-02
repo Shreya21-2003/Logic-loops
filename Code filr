@@ -1,0 +1,151 @@
+import torch
+import torch.nn as nn
+import torch.utils.data as data
+import numpy as np
+import cv2
+import os
+
+class VideoDataset(data.Dataset):
+    def __init__(self, video_folder, num_frames=10, transform=None):
+        self.video_folder = video_folder
+        self.video_files = [f for f in os.listdir(video_folder) if f.endswith('.mp4')]
+        self.num_frames = num_frames
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.video_files)
+
+    def __getitem__(self, idx):
+        video_path = os.path.join(self.video_folder, self.video_files[idx])
+        frames = self.extract_frames(video_path, self.num_frames)
+      
+        label = 0
+        if self.transform:
+            frames = self.transform(frames)
+        return frames, label
+
+    def extract_frames(self, video_path, num_frames):
+        cap = cv2.VideoCapture(video_path)
+        frames = []
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        frame_indices = np.linspace(0, total_frames - 1, num_frames, dtype=int)
+
+        for idx in frame_indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, frame = cap.read()
+            if ret:
+                frame = cv2.resize(frame, (32, 32))  
+                frame = frame.transpose(2, 0, 1) 
+                frames.append(frame)
+            else:
+                break
+        cap.release()
+        return torch.tensor(frames, dtype=torch.float32) / 255.0
+
+class CNNFeatureExtractor(nn.Module):
+    def __init__(self, input_channels, output_dim):
+        super(CNNFeatureExtractor, self).__init__()
+        self.conv = nn.Conv2d(input_channels, output_dim, kernel_size=3)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.pool(x)
+        return x.view(x.size(0), -1)
+
+class EarlyFusion(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super(EarlyFusion, self).__init__()
+        self.fc = nn.Linear(input_dim, hidden_dim)
+        self.classifier = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        x = self.fc(x)
+        return self.classifier(x)
+
+class MidFusion(nn.Module):
+    def __init__(self, input_dim, hidden_dim, mid_dim, final_hidden_dim, output_dim):
+        super(MidFusion, self).__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, mid_dim)
+        self.fc3 = nn.Linear(mid_dim, final_hidden_dim)
+        self.classifier = nn.Linear(final_hidden_dim, output_dim)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.fc2(x)
+        x = self.fc3(x)
+        return self.classifier(x)
+
+class LateFusion(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super(LateFusion, self).__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.classifier1 = nn.Linear(hidden_dim, output_dim)
+        self.classifier2 = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        out1 = self.classifier1(x)
+        out2 = self.classifier2(x)
+        return (out1 + out2) / 2  
+
+class VideoClassificationModel(nn.Module):
+    def __init__(self, feature_extractor, fusion_strategy):
+        super(VideoClassificationModel, self).__init__()
+        self.feature_extractor = feature_extractor
+        self.fusion_strategy = fusion_strategy
+
+    def forward(self, x):
+        batch_size, num_frames, channels, height, width = x.size()
+        x = x.view(batch_size * num_frames, channels, height, width)
+        features = self.feature_extractor(x)
+        features = features.view(batch_size, num_frames, -1)
+        features = features.view(batch_size, -1)
+        return self.fusion_strategy(features)
+
+video_dataset_path = '/content/drive/MyDrive/Videos/Videos/fall'
+
+video_dataset = VideoDataset(video_dataset_path, num_frames=10)
+video_loader = data.DataLoader(video_dataset, batch_size=4, shuffle=True)
+
+input_channels, feature_dim, hidden_dim, num_classes = 3, 256, 512, 10
+num_frames = 10
+feature_extractor = CNNFeatureExtractor(input_channels=input_channels, output_dim=feature_dim)
+early_fusion_strategy = EarlyFusion(feature_dim * num_frames, hidden_dim, num_classes)
+mid_fusion_strategy = MidFusion(feature_dim, hidden_dim, hidden_dim, hidden_dim, num_classes)
+late_fusion_strategy = LateFusion(feature_dim, hidden_dim, num_classes)
+
+model = VideoClassificationModel(feature_extractor, early_fusion_strategy)
+# model = VideoClassificationModel(feature_extractor, mid_fusion_strategy)
+# model = VideoClassificationModel(feature_extractor, late_fusion_strategy)
+
+criterion = nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+def train_model(model, criterion, optimizer, dataloader, num_epochs=5):
+    model.train()
+    for epoch in range(num_epochs):
+        for frames, labels in dataloader:
+            optimizer.zero_grad()
+            outputs = model(frames)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+def evaluate_model(model, dataloader):
+    model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for frames, labels in dataloader:
+            outputs = model(frames)
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+    return correct / total
+
+train_model(model, criterion, optimizer, video_loader, num_epochs=5)
+accuracy = evaluate_model(model, video_loader)
+
+print(f'Test Accuracy: {accuracy * 100}%')
